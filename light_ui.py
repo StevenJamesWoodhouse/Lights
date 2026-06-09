@@ -57,14 +57,6 @@ class LightController:
         )
         print(f"BLE connected → {self._gateway['address']}")
 
-    async def _send_one(self, mesh_address, opcode, data):
-        """Must be called while the lock is already held."""
-        packet = make_command_packet(
-            self._session_key, self._gateway["address"],
-            mesh_address, opcode, data,
-        )
-        await self._client.write_gatt_char(CONTROL_CHAR_UUID, packet, response=False)
-
     async def _send(self, mesh_address, command, rgb, acknowledged):
         async with self._lock:
             for attempt in range(2):
@@ -79,23 +71,11 @@ class LightController:
                     else:
                         r, g, b = rgb
                         opcode, data = OPCODE_SET_COLOR, bytes([dt, COLORMODE_RGB, r, g, b])
-                    await self._send_one(mesh_address, opcode, data)
-                    return
-                except Exception:
-                    self._client = None
-                    self._session_key = None
-                    if attempt == 1:
-                        raise
-
-    async def _send_many(self, commands):
-        """Send multiple (mesh_address, opcode, data) with one lock acquisition."""
-        async with self._lock:
-            for attempt in range(2):
-                try:
-                    if not (self._client and self._client.is_connected):
-                        await self._do_connect()
-                    for mesh_address, opcode, data in commands:
-                        await self._send_one(mesh_address, opcode, data)
+                    packet = make_command_packet(
+                        self._session_key, self._gateway["address"],
+                        mesh_address, opcode, data,
+                    )
+                    await self._client.write_gatt_char(CONTROL_CHAR_UUID, packet, response=acknowledged)
                     return
                 except Exception:
                     self._client = None
@@ -109,11 +89,6 @@ class LightController:
             self._send(mesh_address, command, rgb, acknowledged), self._loop
         ).result(timeout=12.0)
 
-    def send_many(self, commands):
-        asyncio.run_coroutine_threadsafe(
-            self._send_many(commands), self._loop
-        ).result(timeout=12.0)
-
     @property
     def connected(self):
         return bool(self._client and self._client.is_connected)
@@ -122,53 +97,48 @@ class LightController:
 # ---------------------------------------------------------------------------
 # Audio reactor
 # ---------------------------------------------------------------------------
+# All three modes use a single broadcast command (0xFFFF) so every lamp
+# updates simultaneously without per-lamp BLE overhead.
+#
+#  pulse  — RMS → brightness, base colour preserved
+#  color  — spectral centroid → hue (bass=red, treble=violet), RMS → brightness
+#  beat   — onset detection fires a bright flash whose hue reflects the
+#            spectral character; brightness decays until the next hit
 
 class AudioReactor:
-    """
-    Two modes:
-      brightness — overall RMS drives all-lamp brightness (original)
-      spectrum   — FFT bands drive individual lamps sorted by x-position,
-                   each coloured by its frequency (bass=red → treble=violet)
-    """
+    CHUNK = 1024   # ~23 ms at 44100 Hz — snappy response across all modes
 
-    SPECTRUM_CHUNK  = 2048   # larger window → better low-freq resolution
-    BRIGHTNESS_CHUNK = 512
+    def __init__(self, controller: LightController):
+        self._controller = controller
 
-    def __init__(self, controller: LightController, mesh: dict, lamp_layout: list):
-        self._controller  = controller
-        self._device_type = mesh["devices"][0]["deviceType"]
-
-        # Lamps sorted left→right for frequency mapping
-        addr_map = {d["name"]: d["meshAddress"] for d in mesh["devices"]}
-        self._bands = [
-            {"mesh_address": addr_map[l["name"]], "name": l["name"]}
-            for l in sorted(lamp_layout, key=lambda x: x["left"])
-        ]
-        n = len(self._bands)
-
-        # State
-        self.enabled       = False
-        self.mode          = "brightness"   # "brightness" | "spectrum"
-        self.source        = "loopback"     # "loopback"   | "microphone"
-        self.base_color    = (255, 255, 255)
-        self.sensitivity   = 1.0
+        self.enabled        = False
+        self.mode           = "pulse"     # "pulse" | "color" | "beat"
+        self.source         = "loopback"  # "loopback" | "microphone"
+        self.base_color     = (255, 255, 255)
+        self.sensitivity    = 1.0
         self.min_brightness = 0.05
-        self.smoothing     = 0.15
-        self.current_level = 0.0
+        self.smoothing      = 0.35        # EMA alpha — higher = snappier
+        self.current_level  = 0.0        # 0-1 for VU meter
 
-        self._brightness   = 0.0
-        self._band_levels  = np.zeros(n)
+        # shared state written by audio thread, read by send thread
+        self._brightness  = 0.0
+        self._hue         = 0.0   # color / beat mode
+        self._beat_bright = 0.0   # beat mode flash level
+        self._beat_avg    = 0.001 # slow-moving RMS reference for onset detection
+        self._last_beat   = 0.0
+
         self._error: str | None = None
         self._audio_thread: threading.Thread | None = None
         self._send_thread:  threading.Thread | None = None
 
-    # -- public API ----------------------------------------------------------
+    # -- public ---------------------------------------------------------------
 
     def start(self):
-        self._error = None
-        self.enabled = True
-        self._brightness = 0.0
-        self._band_levels[:] = 0.0
+        self._error       = None
+        self.enabled      = True
+        self._brightness  = 0.0
+        self._beat_bright = 0.0
+        self._beat_avg    = 0.001
         self._audio_thread = threading.Thread(target=self._audio_run, daemon=True)
         self._send_thread  = threading.Thread(target=self._send_run,  daemon=True)
         self._audio_thread.start()
@@ -181,7 +151,7 @@ class AudioReactor:
     def error(self):
         return self._error
 
-    # -- audio capture -------------------------------------------------------
+    # -- audio ----------------------------------------------------------------
 
     @staticmethod
     def _find_loopback(pa):
@@ -192,7 +162,19 @@ class AudioReactor:
             dev = pa.get_device_info_by_index(i)
             if dev.get("isLoopbackDevice") and default_out["name"] in dev["name"]:
                 return i, dev
-        raise RuntimeError("WASAPI loopback device not found — ensure a default output device is active")
+        raise RuntimeError("WASAPI loopback not found — ensure a default output device is active")
+
+    @staticmethod
+    def _spectral_centroid_hue(samples: np.ndarray, sr: int) -> float:
+        """Returns a hue in [0, 0.75] tracking spectral centroid on a log scale."""
+        n     = len(samples)
+        mag   = np.abs(np.fft.rfft(samples * np.hanning(n)))
+        freqs = np.fft.rfftfreq(n, 1.0 / sr)
+        total = np.sum(mag) + 1e-10
+        centroid = float(np.sum(freqs * mag) / total)
+        # log-map 150 Hz (bass) → 0.0 (red) … 8000 Hz (treble) → 0.75 (violet)
+        norm = (np.log10(max(centroid, 150)) - np.log10(150)) / (np.log10(8000) - np.log10(150))
+        return float(np.clip(norm * 0.75, 0.0, 0.75))
 
     def _audio_run(self):
         try:
@@ -214,34 +196,51 @@ class AudioReactor:
                 sr = int(dev_info["defaultSampleRate"])
                 ch = dev_info["maxInputChannels"]
 
-            chunk  = self.SPECTRUM_CHUNK if self.mode == "spectrum" else self.BRIGHTNESS_CHUNK
             stream = pa.open(
                 format=pyaudio.paFloat32,
                 channels=ch, rate=sr,
                 input=True, input_device_index=dev_idx,
-                frames_per_buffer=chunk,
+                frames_per_buffer=self.CHUNK,
             )
 
-            alpha  = self.smoothing
-            db_min, db_max = -45.0, -5.0
+            DB_MIN, DB_MAX = -45.0, -5.0
 
             while self.enabled:
-                raw     = stream.read(chunk, exception_on_overflow=False)
+                raw     = stream.read(self.CHUNK, exception_on_overflow=False)
                 samples = np.frombuffer(raw, dtype=np.float32)
                 if ch > 1:
                     samples = samples.reshape(-1, ch).mean(axis=1)
 
-                if self.mode == "spectrum":
-                    energies = self._compute_bands(samples, sr)
-                    self._band_levels = self._band_levels * (1 - alpha) + energies * alpha
-                    self.current_level = float(self._band_levels.mean())
-                else:
-                    rms   = float(np.sqrt(np.mean(samples ** 2)))
-                    db    = 20.0 * np.log10(max(rms, 1e-6))
-                    norm  = (db - db_min) / (db_max - db_min)
-                    norm  = max(0.0, min(1.0, norm * self.sensitivity))
-                    self._brightness   = self._brightness * (1 - alpha) + norm * alpha
+                alpha = self.smoothing
+                rms   = float(np.sqrt(np.mean(samples ** 2)))
+                db    = 20.0 * np.log10(max(rms, 1e-6))
+                vol   = float(np.clip((db - DB_MIN) / (DB_MAX - DB_MIN) * self.sensitivity, 0.0, 1.0))
+
+                if self.mode == "pulse":
+                    self._brightness  = self._brightness * (1 - alpha) + vol * alpha
                     self.current_level = self._brightness
+
+                elif self.mode == "color":
+                    target_hue = self._spectral_centroid_hue(samples, sr)
+                    # hue transitions at half the speed of brightness so it doesn't flicker
+                    self._hue        = self._hue       * (1 - alpha * 0.4) + target_hue * (alpha * 0.4)
+                    self._brightness = self._brightness * (1 - alpha)       + vol         * alpha
+                    self.current_level = self._brightness
+
+                elif self.mode == "beat":
+                    # onset: current RMS > 1.5× slow-moving average, min 120 ms gap
+                    self._beat_avg = self._beat_avg * 0.97 + rms * 0.03
+                    beat = (rms > self._beat_avg * 1.5 and
+                            time.time() - self._last_beat > 0.12)
+                    if beat:
+                        self._last_beat  = time.time()
+                        self._beat_hue   = self._spectral_centroid_hue(samples, sr)
+                        # max brightness clipped to sensitivity, always vivid on hit
+                        self._beat_bright = min(1.0, vol * 1.8 * self.sensitivity)
+                    else:
+                        # exponential decay between beats — tweak 0.88 for longer/shorter tail
+                        self._beat_bright *= 0.88
+                    self.current_level = self._beat_bright
 
             stream.stop_stream()
             stream.close()
@@ -251,58 +250,32 @@ class AudioReactor:
         finally:
             pa.terminate()
 
-    def _compute_bands(self, samples: np.ndarray, sr: int) -> np.ndarray:
-        """Log-spaced FFT energy per band, normalised to 0–1."""
-        n      = len(samples)
-        mag    = np.abs(np.fft.rfft(samples * np.hanning(n))) / n * 2
-        freqs  = np.fft.rfftfreq(n, 1.0 / sr)
-        n_bands = len(self._bands)
-        edges  = np.logspace(np.log10(60), np.log10(16000), n_bands + 1)
-        ref    = 0.04  # magnitude at which a band hits full brightness
-
-        result = np.zeros(n_bands)
-        for i in range(n_bands):
-            mask = (freqs >= edges[i]) & (freqs < edges[i + 1])
-            if mask.any():
-                result[i] = min(1.0, float(np.mean(mag[mask])) / ref * self.sensitivity)
-        return result
-
-    @staticmethod
-    def _band_to_rgb(band_idx: int, n_bands: int, brightness: float):
-        """Map band index to a rainbow hue (red=bass, violet=treble) at given brightness."""
-        hue = (band_idx / max(n_bands - 1, 1)) * 0.75  # 0.0 red → 0.75 violet
-        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, brightness)
-        return int(r * 255), int(g * 255), int(b * 255)
-
-    # -- BLE send ------------------------------------------------------------
+    # -- send -----------------------------------------------------------------
 
     def _send_run(self):
-        dt = self._device_type
-        n  = len(self._bands)
         while self.enabled:
-            if self.mode == "spectrum":
-                commands = []
-                for i, band in enumerate(self._bands):
-                    level = max(self.min_brightness, float(self._band_levels[i]))
-                    r, g, b = self._band_to_rgb(i, n, level)
-                    commands.append((
-                        band["mesh_address"],
-                        OPCODE_SET_COLOR,
-                        bytes([dt, COLORMODE_RGB, r, g, b]),
-                    ))
-                try:
-                    self._controller.send_many(commands)
-                except Exception:
-                    pass
-            else:
-                br = max(self.min_brightness, self._brightness)
-                r0, g0, b0 = self.base_color
-                color = (int(r0 * br), int(g0 * br), int(b0 * br))
-                try:
-                    self._controller.send(0xFFFF, "rgb", color)
-                except Exception:
-                    pass
-            time.sleep(0.08)
+            try:
+                mode = self.mode
+                if mode == "pulse":
+                    br = max(self.min_brightness, self._brightness)
+                    r0, g0, b0 = self.base_color
+                    color = (int(r0 * br), int(g0 * br), int(b0 * br))
+
+                elif mode == "color":
+                    br = max(self.min_brightness, self._brightness)
+                    r, g, b = colorsys.hsv_to_rgb(self._hue, 1.0, br)
+                    color = (int(r * 255), int(g * 255), int(b * 255))
+
+                else:  # beat
+                    br = max(self.min_brightness, self._beat_bright)
+                    r, g, b = colorsys.hsv_to_rgb(self._beat_hue, 1.0, br)
+                    color = (int(r * 255), int(g * 255), int(b * 255))
+
+                self._controller.send(0xFFFF, "rgb", color)
+            except Exception:
+                pass
+            # ~25 fps cap; actual rate is limited by BLE round-trip (~15 fps)
+            time.sleep(0.04)
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +298,7 @@ def get_controller() -> LightController:
 def get_audio_reactor() -> AudioReactor:
     global _audio_reactor
     if _audio_reactor is None:
-        mesh = json.loads(MESH_PATH.read_text(encoding="utf-8"))
-        _audio_reactor = AudioReactor(get_controller(), mesh, LAMP_LAYOUT)
+        _audio_reactor = AudioReactor(get_controller())
     return _audio_reactor
 
 
@@ -375,7 +347,6 @@ def command():
         return jsonify({"error": "lamp and command required"}), 400
 
     mesh = json.loads(MESH_PATH.read_text(encoding="utf-8"))
-
     if lamp == "__all__":
         mesh_address = 0xFFFF
     else:
@@ -405,22 +376,19 @@ def audio_control():
     if "base_color" in data:
         ar.base_color = tuple(data["base_color"])
 
-    mode_changed   = "mode"   in data and data["mode"]   != ar.mode
-    source_changed = "source" in data and data["source"] != ar.source
+    needs_restart = ar.enabled and (
+        ("mode"   in data and data["mode"]   != ar.mode) or
+        ("source" in data and data["source"] != ar.source)
+    )
     if "mode"   in data: ar.mode   = data["mode"]
     if "source" in data: ar.source = data["source"]
 
-    want_enabled = bool(data.get("enabled", ar.enabled))
-    needs_restart = ar.enabled and (mode_changed or source_changed)
-
+    want = bool(data.get("enabled", ar.enabled))
     if needs_restart:
-        ar.stop()
-        time.sleep(0.15)
-        ar.start()
-    elif want_enabled and not ar.enabled:
-        ar.start()
-        time.sleep(0.15)
-    elif not want_enabled and ar.enabled:
+        ar.stop(); time.sleep(0.15); ar.start()
+    elif want and not ar.enabled:
+        ar.start(); time.sleep(0.15)
+    elif not want and ar.enabled:
         ar.stop()
 
     if ar.error:
@@ -485,12 +453,12 @@ button {
 }
 button:active   { transform: scale(.95); }
 button:disabled { opacity: .35; cursor: not-allowed; transform: none; }
-.btn-on      { background: #43a047; color: #fff; }
-.btn-off     { background: #e53935; color: #fff; }
-.btn-toggle  { background: #37474f; color: #aaa; }
+.btn-on     { background: #43a047; color: #fff; }
+.btn-off    { background: #e53935; color: #fff; }
+.btn-toggle { background: #37474f; color: #aaa; }
 .btn-toggle.active { background: #0288d1; color: #fff; }
-.btn-opt     { background: #263238; color: #90a4ae; }
-.btn-opt.active    { background: #37474f; color: #fff; }
+.btn-opt    { background: #263238; color: #90a4ae; }
+.btn-opt.active    { background: #37474f; color: #e0e0ff; }
 
 .slider-group { display: flex; align-items: center; gap: 5px; }
 .slider-group label { font-size: .7rem; color: #6060a0; white-space: nowrap; }
@@ -501,7 +469,7 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
 .vu-fill {
     height: 100%; width: 0%;
     background: linear-gradient(to right, #4caf50 0%, #ff9800 70%, #f44336 100%);
-    transition: width .08s linear; border-radius: 5px;
+    transition: width .06s linear; border-radius: 5px;
 }
 .err-text { font-size: .7rem; color: #e53935; }
 
@@ -515,7 +483,7 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
     position: relative; width: 62px; height: 62px; border-radius: 50%;
     background: #ffffff; border: 3px solid #2a2a4a; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
-    transition: border-color .2s, box-shadow .2s;
+    transition: background .06s, border-color .2s, box-shadow .2s;
 }
 .lamp-circle:hover { border-color: #9090ee; box-shadow: 0 0 12px rgba(144,144,238,.4); }
 .lamp-circle input[type=color] {
@@ -533,6 +501,12 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
 .st.ok      { color: #4caf50; }
 .st.err     { color: #e53935; }
 .st.sending { color: #42a5f5; }
+
+/* mode descriptions shown below audio panel */
+.mode-hint {
+    font-size: .7rem; color: #5050a0; margin-top: -10px; margin-bottom: 14px;
+    padding-left: 4px;
+}
 </style>
 </head>
 <body>
@@ -563,8 +537,9 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
 
     <div class="divider"></div>
 
-    <button class="btn-opt active" id="mode-brightness" onclick="setMode('brightness')">Brightness</button>
-    <button class="btn-opt"        id="mode-spectrum"   onclick="setMode('spectrum')">🌈 Spectrum</button>
+    <button class="btn-opt active" id="mode-pulse" onclick="setMode('pulse')">Pulse</button>
+    <button class="btn-opt"        id="mode-color" onclick="setMode('color')">🎨 Color</button>
+    <button class="btn-opt"        id="mode-beat"  onclick="setMode('beat')">⚡ Beat</button>
 
     <div class="divider"></div>
 
@@ -585,19 +560,26 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
     </div>
     <div class="slider-group">
         <label>Smooth</label>
-        <input type="range" id="smooth" min="5" max="60" value="15" oninput="onSlider()">
-        <span class="slider-val" id="smooth-val">0.15</span>
+        <input type="range" id="smooth" min="5" max="80" value="35" oninput="onSlider()">
+        <span class="slider-val" id="smooth-val">0.35</span>
     </div>
 
     <div class="vu-wrap"><div class="vu-fill" id="vu-fill"></div></div>
     <span class="err-text" id="audio-err"></span>
 </div>
+<div class="mode-hint" id="mode-hint">Volume controls brightness. Base colour set by the All picker above.</div>
 
-<!-- room layout -->
+<!-- room -->
 <div id="room"></div>
 
 <script>
 const LAYOUT = {{ layout|tojson }};
+
+const MODE_HINTS = {
+    pulse: 'Volume controls brightness. Base colour set by the All picker above.',
+    color: 'Spectral centroid shifts hue in real time: bass → red/orange, treble → blue/violet.',
+    beat:  'Onset detection fires a flash on each beat. Hue reflects the spectral character of the hit.',
+};
 
 // build lamp circles
 const room = document.getElementById('room');
@@ -623,7 +605,6 @@ LAYOUT.forEach(lamp => {
 
 // colour wiring
 const timers = {};
-
 const allInput = document.getElementById('color-__all__');
 allInput.addEventListener('input', () => {
     const v = allInput.value;
@@ -636,7 +617,6 @@ allInput.addEventListener('input', () => {
     clearTimeout(timers['__all__']);
     timers['__all__'] = setTimeout(() => send('__all__', 'rgb'), 180);
 });
-
 LAYOUT.forEach(l => {
     const input  = document.getElementById(`color-${l.name}`);
     const circle = document.getElementById(`circle-${l.name}`);
@@ -647,7 +627,6 @@ LAYOUT.forEach(l => {
     });
 });
 
-// helpers
 function hexToRgb(hex) {
     const v = hex.replace('#', '');
     return [parseInt(v.slice(0,2),16), parseInt(v.slice(2,4),16), parseInt(v.slice(4,6),16)];
@@ -659,27 +638,22 @@ function setSt(id, cls, msg) {
     el.textContent = msg;
     if (cls === 'ok') setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 2000);
 }
-
-// commands
 async function send(lamp, command) {
     const rgb = command === 'rgb' ? hexToRgb(document.getElementById(`color-${lamp}`).value) : null;
     setSt(lamp, 'sending', '…');
     try {
         const res  = await fetch('/api/command', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({lamp, command, rgb}),
         });
         const data = await res.json();
         setSt(lamp, data.ok ? 'ok' : 'err', data.ok ? '✓' : (data.error || 'Error'));
-    } catch {
-        setSt(lamp, 'err', 'Network error');
-    }
+    } catch { setSt(lamp, 'err', 'Network error'); }
 }
 
-// audio state
+// audio controls
 let audioEnabled = false;
-let audioMode    = 'brightness';
+let audioMode    = 'pulse';
 let audioSource  = 'loopback';
 
 async function toggleAudio() {
@@ -688,34 +662,36 @@ async function toggleAudio() {
 }
 function setMode(m) {
     audioMode = m;
-    document.getElementById('mode-brightness').className = 'btn-opt' + (m === 'brightness' ? ' active' : '');
-    document.getElementById('mode-spectrum').className   = 'btn-opt' + (m === 'spectrum'   ? ' active' : '');
+    ['pulse','color','beat'].forEach(id => {
+        document.getElementById(`mode-${id}`).className = 'btn-opt' + (m === id ? ' active' : '');
+    });
+    document.getElementById('mode-hint').textContent = MODE_HINTS[m] || '';
     if (audioEnabled) pushAudio();
 }
 function setSource(s) {
     audioSource = s;
-    document.getElementById('src-loopback').className   = 'btn-opt' + (s === 'loopback'    ? ' active' : '');
-    document.getElementById('src-microphone').className = 'btn-opt' + (s === 'microphone'  ? ' active' : '');
+    ['loopback','microphone'].forEach(id => {
+        document.getElementById(`src-${id}`).className = 'btn-opt' + (s === id ? ' active' : '');
+    });
     if (audioEnabled) pushAudio();
 }
 function onSlider() {
-    document.getElementById('sens-val').textContent  = (document.getElementById('sens').value  / 100).toFixed(2) + '×';
-    document.getElementById('minbr-val').textContent = document.getElementById('minbr').value  + '%';
+    document.getElementById('sens-val').textContent  = (document.getElementById('sens').value   / 100).toFixed(2) + '×';
+    document.getElementById('minbr-val').textContent =  document.getElementById('minbr').value  + '%';
     document.getElementById('smooth-val').textContent = (document.getElementById('smooth').value / 100).toFixed(2);
     if (audioEnabled) pushAudio();
 }
 async function pushAudio() {
     try {
         const res  = await fetch('/api/audio', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 enabled:        audioEnabled,
                 mode:           audioMode,
                 source:         audioSource,
-                sensitivity:    document.getElementById('sens').value    / 100,
-                min_brightness: document.getElementById('minbr').value   / 100,
-                smoothing:      document.getElementById('smooth').value  / 100,
+                sensitivity:    document.getElementById('sens').value   / 100,
+                min_brightness: document.getElementById('minbr').value  / 100,
+                smoothing:      document.getElementById('smooth').value / 100,
                 base_color:     hexToRgb(document.getElementById('color-__all__').value),
             }),
         });
@@ -725,22 +701,18 @@ async function pushAudio() {
         btn.textContent = audioEnabled ? '🔊 On' : '🔊 Off';
         btn.className   = 'btn-toggle' + (audioEnabled ? ' active' : '');
         document.getElementById('audio-err').textContent = data.error || '';
-    } catch {
-        document.getElementById('audio-err').textContent = 'Network error';
-    }
+    } catch { document.getElementById('audio-err').textContent = 'Network error'; }
 }
 
-// VU meter — in spectrum mode, show per-lamp colours from the server level
 (async function pollLevel() {
     try {
         const res  = await fetch('/api/audio/level');
         const data = await res.json();
         document.getElementById('vu-fill').style.width = (data.level * 100).toFixed(1) + '%';
     } catch {}
-    setTimeout(pollLevel, 100);
+    setTimeout(pollLevel, 80);
 })();
 
-// BLE dot
 (async function pollStatus() {
     try {
         const r = await fetch('/api/status');
