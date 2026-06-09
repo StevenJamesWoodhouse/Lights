@@ -1,0 +1,21 @@
+{
+  "placeUniID": "",
+  "displayName": "Location 1",
+  "meshKey": "",
+  "meshPassword": "",
+  "meshLTK": "",
+  "devices": [
+    {"name": "Lamp1", "address": "", "meshAddress": 1, "deviceType": 5},
+    {"name": "Lamp2", "address": "", "meshAddress": 2, "deviceType": 5},
+    {"name": "Lamp3", "address": "", "meshAddress": 3, "deviceType": 5},
+    {"name": "Lamp4", "address": "", "meshAddress": 4, "deviceType": 5},
+    {"name": "Lamp5", "address": "", "meshAddress": 5, "deviceType": 5},
+    {"name": "Lamp6", "address": "", "meshAddress": 6, "deviceType": 5},
+    {"name": "Lamp7", "address": "", "meshAddress": 7, "deviceType": 5},
+    {"name": "Lamp8", "address": "", "meshAddress": 8, "deviceType": 5},
+    {"name": "Lamp9", "address": "", "meshAddress": 9, "deviceType": 5},
+    {"name": "Lamp10", "address": "", "meshAddress": 10, "deviceType": 5},
+    {"name": "Lamp11", "address": "", "meshAddress": 11, "deviceType": 5},
+    {"name": "Lamp12", "address": "", "meshAddress": 12, "deviceType": 5}
+  ]
+}

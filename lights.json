@@ -1,0 +1,28 @@
+{
+  "brand": "ZengGe",
+  "advertised_name": "ZenggeMesh",
+  "manufacturer_ids": ["529", "63517"],
+  "protocol_guess": "Telink/Zengge mesh over BLE GATT",
+  "gatt_service_uuid": "00010203-0405-0607-0809-0a0b0c0d1910",
+  "notify_characteristic_uuid": "00010203-0405-0607-0809-0a0b0c0d1911",
+  "candidate_write_characteristics": [
+    "00010203-0405-0607-0809-0a0b0c0d1911",
+    "00010203-0405-0607-0809-0a0b0c0d1912",
+    "00010203-0405-0607-0809-0a0b0c0d1913",
+    "00010203-0405-0607-0809-0a0b0c0d1914"
+  ],
+  "lights": [
+    {"id": "light-01", "address": "F8:1D:78:69:B3:A3", "last_rssi": -55, "label": ""},
+    {"id": "light-02", "address": "F8:1D:78:69:B9:E6", "last_rssi": -64, "label": ""},
+    {"id": "light-03", "address": "F8:1D:78:69:AD:A3", "last_rssi": -66, "label": ""},
+    {"id": "light-04", "address": "F8:1D:78:6A:6B:AF", "last_rssi": -66, "label": ""},
+    {"id": "light-05", "address": "F8:1D:78:69:A4:60", "last_rssi": -70, "label": ""},
+    {"id": "light-06", "address": "F8:1D:78:6B:38:2D", "last_rssi": -70, "label": ""},
+    {"id": "light-07", "address": "F8:1D:78:6B:4B:C7", "last_rssi": -72, "label": ""},
+    {"id": "light-08", "address": "F8:1D:78:69:B5:45", "last_rssi": -73, "label": ""},
+    {"id": "light-09", "address": "F8:1D:78:69:8C:DF", "last_rssi": -74, "label": ""},
+    {"id": "light-10", "address": "F8:1D:78:69:96:BA", "last_rssi": -77, "label": ""},
+    {"id": "light-11", "address": "F8:1D:78:6B:4F:F8", "last_rssi": -80, "label": ""},
+    {"id": "light-12", "address": "F8:1D:78:69:C9:AB", "last_rssi": -81, "label": ""}
+  ]
+}
