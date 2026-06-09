@@ -6,10 +6,10 @@ import time
 from pathlib import Path
 
 import numpy as np
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from flask import Flask, jsonify, render_template_string, request
 
-from telink_packets import make_command_packet, make_pair_packet, make_session_key
+from telink_packets import encrypt_block, make_command_packet, make_pair_packet, make_session_key
 
 
 MESH_PATH = Path("hao_deng_mesh.json")
@@ -17,8 +17,231 @@ PAIR_CHAR_UUID    = "00010203-0405-0607-0809-0a0b0c0d1914"
 CONTROL_CHAR_UUID = "00010203-0405-0607-0809-0a0b0c0d1912"
 OPCODE_SET_COLOR  = 0xE2
 OPCODE_SET_STATE  = 0xD0
+OPCODE_MESH_RESET = 0xE3
+OPCODE_SET_MESH_ADDRESS = 0xE0
 COLORMODE_RGB     = 0x60
 STATEACTION_POWER = 0x01
+CONTROL_DEVICE_TYPE = 0xFF
+DEFAULT_MESH = {
+    "meshKey": "ZenggeMesh",
+    "meshPassword": "ZenggeTechnology",
+    "meshLTK": "ZenggeTechnology",
+}
+PROVISION_SETTLE_SECONDS = 1.0
+PROVISION_SCAN_SECONDS = 10.0
+PROVISION_CONCURRENCY = 3
+
+
+def mesh_credentials(mesh):
+    return {
+        "meshKey": mesh["meshKey"],
+        "meshPassword": mesh["meshPassword"],
+        "meshLTK": mesh["meshLTK"],
+    }
+
+
+async def login_client(client, credentials):
+    pair_packet, session_random = make_pair_packet(
+        credentials["meshKey"], credentials["meshPassword"]
+    )
+    await client.write_gatt_char(PAIR_CHAR_UUID, pair_packet, response=True)
+    await asyncio.sleep(0.1)
+    reply = bytes(await client.read_gatt_char(PAIR_CHAR_UUID))
+    if not reply or reply[0] != 0x0D:
+        raise RuntimeError(f"auth rejected: {reply.hex() if reply else 'empty'}")
+    return make_session_key(
+        credentials["meshKey"],
+        credentials["meshPassword"],
+        session_random,
+        reply[1:9],
+    )
+
+
+async def scan_ble_targets(devices, timeout=PROVISION_SCAN_SECONDS):
+    wanted = {device["address"].upper(): device for device in devices}
+    found = {}
+    discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    for address, pair in discovered.items():
+        if address.upper() in wanted:
+            found[address.upper()] = pair[0]
+    return found
+
+
+async def resolve_ble_target(address, timeout=8.0, targets=None):
+    if targets and address.upper() in targets:
+        return targets[address.upper()]
+    device = await BleakScanner.find_device_by_address(address, timeout=timeout)
+    return device if device is not None else address
+
+
+async def try_login(address, credentials, timeout=10.0, targets=None):
+    target = await resolve_ble_target(address, timeout=min(timeout, 8.0), targets=targets)
+    async with BleakClient(target, timeout=timeout) as client:
+        await login_client(client, credentials)
+
+
+async def write_mesh_field(client, session_key, field_id, value):
+    data = encrypt_block(session_key, value.encode("ascii"))
+    await client.write_gatt_char(PAIR_CHAR_UUID, bytes([field_id]) + bytes(data))
+
+
+async def provision_device(device, source_credentials, target_credentials, timeout=12.0, targets=None):
+    address = device["address"]
+    target = await resolve_ble_target(address, timeout=min(timeout, 8.0), targets=targets)
+    async with BleakClient(target, timeout=timeout) as client:
+        session_key = await login_client(client, source_credentials)
+        await write_mesh_field(client, session_key, 0x04, target_credentials["meshKey"])
+        await write_mesh_field(client, session_key, 0x05, target_credentials["meshPassword"])
+        await write_mesh_field(client, session_key, 0x06, target_credentials["meshLTK"])
+        await asyncio.sleep(PROVISION_SETTLE_SECONDS)
+        reply = bytes(await client.read_gatt_char(PAIR_CHAR_UUID))
+        if not reply or reply[0] != 0x07:
+            raise RuntimeError(f"provision rejected: {reply.hex() if reply else 'empty'}")
+
+
+def default_mesh_address(device):
+    return int(device["address"].split(":")[-1], 16)
+
+
+async def set_mesh_address(device, credentials, dest, timeout=12.0, targets=None):
+    target = await resolve_ble_target(device["address"], timeout=min(timeout, 8.0), targets=targets)
+    async with BleakClient(target, timeout=timeout) as client:
+        session_key = await login_client(client, credentials)
+        packet = make_command_packet(
+            session_key,
+            device["address"],
+            dest,
+            OPCODE_SET_MESH_ADDRESS,
+            int(device["meshAddress"]).to_bytes(2, "little"),
+        )
+        await client.write_gatt_char(CONTROL_CHAR_UUID, packet, response=True)
+        await asyncio.sleep(0.2)
+
+
+async def ensure_configured_mesh_address(device, credentials, timeout=12.0, targets=None):
+    errors = []
+    for dest in (int(device["meshAddress"]), default_mesh_address(device)):
+        try:
+            await set_mesh_address(device, credentials, dest, timeout, targets)
+            return
+        except Exception as exc:
+            errors.append(f"dest 0x{dest:02X}: {exc}")
+    raise RuntimeError("; ".join(errors))
+
+
+async def ensure_device_mesh(
+    device,
+    target_credentials,
+    fallback_credentials,
+    timeout=12.0,
+    set_address=False,
+    targets=None,
+    check_target=True,
+):
+    address = device["address"]
+    if check_target:
+        try:
+            await try_login(address, target_credentials, timeout, targets)
+            if set_address:
+                await ensure_configured_mesh_address(device, target_credentials, timeout, targets)
+            return "already"
+        except Exception:
+            pass
+
+    await provision_device(device, fallback_credentials, target_credentials, timeout, targets)
+    await asyncio.sleep(0.3)
+    await try_login(address, target_credentials, timeout, targets)
+    if set_address:
+        await ensure_configured_mesh_address(device, target_credentials, timeout, targets)
+    return "provisioned"
+
+
+async def ensure_mesh(
+    devices,
+    target_credentials,
+    fallback_credentials,
+    timeout=12.0,
+    raise_on_failure=True,
+    set_addresses=False,
+    concurrency=PROVISION_CONCURRENCY,
+    check_target=True,
+):
+    targets = await scan_ble_targets(devices)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def worker(index, device):
+        async with semaphore:
+            return index, await ensure_one(device)
+
+    async def ensure_one(device):
+        try:
+            action = await ensure_device_mesh(
+                device,
+                target_credentials,
+                fallback_credentials,
+                timeout,
+                set_addresses,
+                targets,
+                check_target,
+            )
+            result = {"name": device["name"], "ok": True, "action": action}
+            print(f"{device['name']} {action} -> {target_credentials['meshKey']}")
+        except Exception as exc:
+            result = {"name": device["name"], "ok": False, "error": str(exc)}
+            print(f"{device['name']} provision failed: {exc}")
+        return result
+
+    ordered = await asyncio.gather(
+        *(worker(index, device) for index, device in enumerate(devices))
+    )
+    results = [result for _, result in sorted(ordered, key=lambda item: item[0])]
+    failures = [item for item in results if not item["ok"]]
+    if failures and raise_on_failure:
+        names = ", ".join(f"{item['name']} ({item['error']})" for item in failures)
+        raise RuntimeError(f"Provisioning failed for: {names}")
+    return results
+
+
+def provision_failures(results):
+    return [item for item in results if not item.get("ok")]
+
+
+async def send_default_mesh_reset(devices, timeout=12.0):
+    errors = []
+    for device in devices:
+        try:
+            target = await resolve_ble_target(device["address"], timeout=min(timeout, 8.0))
+            async with BleakClient(target, timeout=timeout) as client:
+                session_key = await login_client(client, DEFAULT_MESH)
+                packet = make_command_packet(
+                    session_key,
+                    device["address"],
+                    0xFFFF,
+                    OPCODE_MESH_RESET,
+                    b"\x00",
+                )
+                await client.write_gatt_char(CONTROL_CHAR_UUID, packet, response=True)
+                await asyncio.sleep(1.0)
+                print(f"Broadcast default mesh reset via {device['name']}")
+                return {
+                    "name": "__all__",
+                    "ok": True,
+                    "action": f"broadcast reset via {device['name']}",
+                }
+        except Exception as exc:
+            errors.append(f"{device['name']}: {exc}")
+    return {
+        "name": "__all__",
+        "ok": False,
+        "action": "broadcast reset failed",
+        "error": "; ".join(errors[-3:]),
+    }
+
+
+async def gateway_accepts_mesh(mesh, credentials, timeout=12.0):
+    gateway = mesh["devices"][0]
+    await try_login(gateway["address"], credentials, timeout)
+    return [{"name": gateway["name"], "ok": True, "action": "gateway already"}]
 
 
 # ---------------------------------------------------------------------------
@@ -33,15 +256,19 @@ class LightController:
         self._session_key = None
         self._lock = asyncio.Lock()
         self._loop = asyncio.new_event_loop()
-        threading.Thread(target=self._loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        self._last_error = None
 
     async def _connect(self):
         async with self._lock:
             await self._do_connect()
 
     async def _do_connect(self):
-        self._client = BleakClient(self._gateway["address"], timeout=10.0)
+        if self._client and self._client.is_connected:
+            return
+        target = await resolve_ble_target(self._gateway["address"])
+        self._client = BleakClient(target, timeout=10.0)
         await self._client.connect()
         pair_packet, session_random = make_pair_packet(
             self._mesh["meshKey"], self._mesh["meshPassword"]
@@ -57,20 +284,57 @@ class LightController:
         )
         print(f"BLE connected → {self._gateway['address']}")
 
+    async def _disconnect(self):
+        async with self._lock:
+            client = self._client
+            self._client = None
+            self._session_key = None
+            if client and client.is_connected:
+                await client.disconnect()
+                print(f"BLE disconnected -> {self._gateway['address']}")
+
+    def connect(self):
+        future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+        try:
+            future.result(timeout=15.0)
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = str(exc)
+            try:
+                asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop).result(timeout=5.0)
+            except Exception:
+                pass
+            raise
+
+    def disconnect(self):
+        future = asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
+        try:
+            future.result(timeout=15.0)
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
+
+    def shutdown(self):
+        try:
+            if self._loop.is_running():
+                self.disconnect()
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=2.0)
+
     async def _send(self, mesh_address, command, rgb, acknowledged):
         async with self._lock:
             for attempt in range(2):
                 try:
                     if not (self._client and self._client.is_connected):
                         await self._do_connect()
-                    dt = self._gateway["deviceType"]
                     if command == "on":
-                        opcode, data = OPCODE_SET_STATE, bytes([dt, STATEACTION_POWER, 1])
+                        opcode, data = OPCODE_SET_STATE, bytes([CONTROL_DEVICE_TYPE, STATEACTION_POWER, 1])
                     elif command == "off":
-                        opcode, data = OPCODE_SET_STATE, bytes([dt, STATEACTION_POWER, 0])
+                        opcode, data = OPCODE_SET_STATE, bytes([CONTROL_DEVICE_TYPE, STATEACTION_POWER, 0])
                     else:
                         r, g, b = rgb
-                        opcode, data = OPCODE_SET_COLOR, bytes([dt, COLORMODE_RGB, r, g, b])
+                        opcode, data = OPCODE_SET_COLOR, bytes([CONTROL_DEVICE_TYPE, COLORMODE_RGB, r, g, b])
                     packet = make_command_packet(
                         self._session_key, self._gateway["address"],
                         mesh_address, opcode, data,
@@ -78,9 +342,13 @@ class LightController:
                     await self._client.write_gatt_char(CONTROL_CHAR_UUID, packet, response=acknowledged)
                     return
                 except Exception:
+                    client = self._client
                     self._client = None
                     self._session_key = None
+                    if client and client.is_connected:
+                        await client.disconnect()
                     if attempt == 1:
+                        self._last_error = "send failed"
                         raise
 
     def send(self, mesh_address, command, rgb=None):
@@ -92,6 +360,10 @@ class LightController:
     @property
     def connected(self):
         return bool(self._client and self._client.is_connected)
+
+    @property
+    def last_error(self):
+        return self._last_error
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +416,13 @@ class AudioReactor:
         self._audio_thread.start()
         self._send_thread.start()
 
-    def stop(self):
+    def stop(self, join=False):
         self.enabled = False
+        if join:
+            current = threading.current_thread()
+            for thread in (self._audio_thread, self._send_thread):
+                if thread and thread.is_alive() and thread is not current:
+                    thread.join(timeout=2.0)
 
     @property
     def error(self):
@@ -285,20 +562,109 @@ class AudioReactor:
 app = Flask(__name__)
 _controller:    LightController | None = None
 _audio_reactor: AudioReactor    | None = None
+_control_lock = threading.Lock()
+_provisioned_active = False
+_control_phase = "stopped"
+_last_provision = []
+_shutdown_started = False
 
 
-def get_controller() -> LightController:
-    global _controller
-    if _controller is None:
-        mesh = json.loads(MESH_PATH.read_text(encoding="utf-8"))
-        _controller = LightController(mesh)
+def load_mesh():
+    return json.loads(MESH_PATH.read_text(encoding="utf-8"))
+
+
+def get_controller() -> LightController | None:
     return _controller
+
+
+def start_control() -> LightController:
+    global _controller, _provisioned_active, _control_phase, _last_provision
+    with _control_lock:
+        mesh = load_mesh()
+        active_credentials = mesh_credentials(mesh)
+        if not _provisioned_active:
+            _control_phase = "checking app mesh"
+            try:
+                _last_provision = asyncio.run(
+                    gateway_accepts_mesh(mesh, active_credentials)
+                )
+            except Exception:
+                _control_phase = "provisioning app mesh"
+                try:
+                    _last_provision = asyncio.run(
+                        ensure_mesh(
+                            mesh["devices"],
+                            active_credentials,
+                            DEFAULT_MESH,
+                            set_addresses=True,
+                            check_target=False,
+                        )
+                    )
+                except Exception:
+                    _control_phase = "provisioning app mesh (mixed state retry)"
+                    _last_provision = asyncio.run(
+                        ensure_mesh(
+                            mesh["devices"],
+                            active_credentials,
+                            DEFAULT_MESH,
+                            set_addresses=True,
+                        )
+                    )
+            _provisioned_active = True
+        _control_phase = "connecting"
+        if _controller is None:
+            _controller = LightController(mesh)
+        _controller.connect()
+        _control_phase = "active"
+        return _controller
+
+
+def stop_control(force_restore=False):
+    global _controller, _audio_reactor, _provisioned_active, _control_phase, _last_provision
+    with _control_lock:
+        mesh = load_mesh()
+        active_credentials = mesh_credentials(mesh)
+        if _audio_reactor is not None:
+            _control_phase = "stopping audio"
+            _audio_reactor.stop(join=True)
+            _audio_reactor = None
+        if _controller is not None:
+            _control_phase = "disconnecting"
+            _controller.shutdown()
+            _controller = None
+        if _provisioned_active or force_restore:
+            _control_phase = "restoring default mesh"
+            _last_provision = asyncio.run(
+                ensure_mesh(
+                    mesh["devices"],
+                    DEFAULT_MESH,
+                    active_credentials,
+                    raise_on_failure=False,
+                )
+            )
+            failures = provision_failures(_last_provision)
+            if not failures:
+                reset_result = asyncio.run(send_default_mesh_reset(mesh["devices"]))
+                _last_provision.append(reset_result)
+                failures = provision_failures(_last_provision)
+            _provisioned_active = bool(failures)
+            _control_phase = "restore incomplete" if failures else "stopped"
+            return _last_provision
+        _control_phase = "stopped"
+        return _last_provision
+
+
+def require_controller() -> LightController:
+    controller = get_controller()
+    if controller is None or not controller.connected:
+        raise RuntimeError("Connection is stopped. Press Start Control first.")
+    return controller
 
 
 def get_audio_reactor() -> AudioReactor:
     global _audio_reactor
     if _audio_reactor is None:
-        _audio_reactor = AudioReactor(get_controller())
+        _audio_reactor = AudioReactor(require_controller())
     return _audio_reactor
 
 
@@ -333,7 +699,59 @@ def index():
 
 @app.route("/api/status")
 def status():
-    return jsonify({"connected": get_controller().connected})
+    controller = get_controller()
+    return jsonify({
+        "active": controller is not None,
+        "connected": bool(controller and controller.connected),
+        "provisioned": _provisioned_active,
+        "phase": _control_phase,
+        "provision": _last_provision,
+        "error": controller.last_error if controller else None,
+    })
+
+
+@app.route("/api/connect", methods=["POST"])
+def connect_control():
+    try:
+        controller = start_control()
+        return jsonify({
+            "ok": True,
+            "connected": controller.connected,
+            "phase": _control_phase,
+            "provision": _last_provision,
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "connected": False,
+            "phase": _control_phase,
+            "provision": _last_provision,
+            "error": str(exc),
+        }), 500
+
+
+@app.route("/api/disconnect", methods=["POST"])
+def disconnect_control():
+    try:
+        results = stop_control(force_restore=True)
+        failures = provision_failures(results)
+        return jsonify({
+            "ok": not failures,
+            "connected": False,
+            "phase": _control_phase,
+            "provision": results,
+            "error": None if not failures else "Restore incomplete: " + ", ".join(
+                item["name"] for item in failures
+            ),
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "connected": False,
+            "phase": _control_phase,
+            "provision": _last_provision,
+            "error": str(exc),
+        }), 500
 
 
 @app.route("/api/command", methods=["POST"])
@@ -346,7 +764,7 @@ def command():
     if not lamp or not cmd:
         return jsonify({"error": "lamp and command required"}), 400
 
-    mesh = json.loads(MESH_PATH.read_text(encoding="utf-8"))
+    mesh = load_mesh()
     if lamp == "__all__":
         mesh_address = 0xFFFF
     else:
@@ -356,19 +774,23 @@ def command():
         mesh_address = device["meshAddress"]
 
     try:
-        get_controller().send(mesh_address, cmd, tuple(rgb) if rgb else None)
-        ar = get_audio_reactor()
-        if lamp == "__all__" and cmd == "rgb" and rgb and ar.enabled:
+        require_controller().send(mesh_address, cmd, tuple(rgb) if rgb else None)
+        ar = _audio_reactor
+        if ar and lamp == "__all__" and cmd == "rgb" and rgb and ar.enabled:
             ar.base_color = tuple(rgb)
         return jsonify({"ok": True})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        status_code = 409 if "Connection is stopped" in str(exc) else 500
+        return jsonify({"error": str(exc)}), status_code
 
 
 @app.route("/api/audio", methods=["POST"])
 def audio_control():
     data = request.get_json(force=True)
-    ar   = get_audio_reactor()
+    try:
+        ar = get_audio_reactor()
+    except Exception as exc:
+        return jsonify({"ok": False, "enabled": False, "error": str(exc)}), 409
 
     ar.sensitivity    = float(data.get("sensitivity",    ar.sensitivity))
     ar.min_brightness = float(data.get("min_brightness", ar.min_brightness))
@@ -398,7 +820,9 @@ def audio_control():
 
 @app.route("/api/audio/level")
 def audio_level():
-    ar = get_audio_reactor()
+    ar = _audio_reactor
+    if ar is None:
+        return jsonify({"level": 0.0, "enabled": False})
     return jsonify({"level": ar.current_level, "enabled": ar.enabled})
 
 
@@ -437,6 +861,7 @@ h1 { font-size: 1.2rem; letter-spacing: .05em; color: #9090ee; }
     font-size: .72rem; font-weight: 700; text-transform: uppercase;
     letter-spacing: .1em; color: #6060a0; white-space: nowrap;
 }
+.conn-text { font-size: .75rem; color: #9090ee; min-width: 90px; }
 .divider { width: 1px; height: 24px; background: #2a2a4a; flex-shrink: 0; }
 
 .swatch-wrap { position: relative; width: 64px; height: 32px; }
@@ -516,6 +941,14 @@ input[type=range] { width: 80px; accent-color: #9090ee; cursor: pointer; }
     <h1>Hao Deng Control</h1>
 </header>
 
+<!-- connection -->
+<div class="panel">
+    <span class="panel-label">Control</span>
+    <button class="btn-on" id="connect-btn" onclick="startControl()">Start Control</button>
+    <button class="btn-off" id="disconnect-btn" onclick="stopControl()" disabled>Stop Control</button>
+    <span class="conn-text" id="conn-text">Stopped</span>
+</div>
+
 <!-- master -->
 <div class="panel">
     <span class="panel-label">All</span>
@@ -581,6 +1014,56 @@ const MODE_HINTS = {
     beat:  'Onset detection fires a flash on each beat. Hue reflects the spectral character of the hit.',
 };
 
+let controlConnected = false;
+
+function setControlState(connected, error, phase) {
+    controlConnected = !!connected;
+    document.getElementById('conn-dot').className = controlConnected ? 'on' : 'off';
+    document.getElementById('conn-text').textContent = error || phase || (controlConnected ? 'Active' : 'Stopped');
+    document.getElementById('connect-btn').disabled = controlConnected;
+    document.getElementById('disconnect-btn').disabled = !controlConnected;
+    document.querySelectorAll('button').forEach(btn => {
+        if (btn.id !== 'connect-btn' && btn.id !== 'disconnect-btn') {
+            btn.disabled = !controlConnected;
+        }
+    });
+    document.querySelectorAll('input[type=color]').forEach(input => {
+        input.disabled = !controlConnected;
+    });
+    if (!controlConnected) {
+        audioEnabled = false;
+        const btn = document.getElementById('audio-btn');
+        if (btn) {
+            btn.textContent = 'Off';
+            btn.className = 'btn-toggle';
+        }
+        const vu = document.getElementById('vu-fill');
+        if (vu) vu.style.width = '0%';
+    }
+}
+
+async function startControl() {
+    document.getElementById('conn-text').textContent = 'Provisioning...';
+    try {
+        const res = await fetch('/api/connect', {method: 'POST'});
+        const data = await res.json();
+        setControlState(data.connected, data.error, data.phase);
+    } catch {
+        setControlState(false, 'Network error');
+    }
+}
+
+async function stopControl() {
+    document.getElementById('conn-text').textContent = 'Restoring...';
+    try {
+        const res = await fetch('/api/disconnect', {method: 'POST'});
+        const data = await res.json();
+        setControlState(false, data.error, data.phase);
+    } catch {
+        setControlState(false, 'Network error');
+    }
+}
+
 // build lamp circles
 const room = document.getElementById('room');
 LAYOUT.forEach(lamp => {
@@ -639,6 +1122,10 @@ function setSt(id, cls, msg) {
     if (cls === 'ok') setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 2000);
 }
 async function send(lamp, command) {
+    if (!controlConnected) {
+        setSt(lamp, 'err', 'Stopped');
+        return;
+    }
     const rgb = command === 'rgb' ? hexToRgb(document.getElementById(`color-${lamp}`).value) : null;
     setSt(lamp, 'sending', '…');
     try {
@@ -657,6 +1144,10 @@ let audioMode    = 'pulse';
 let audioSource  = 'loopback';
 
 async function toggleAudio() {
+    if (!controlConnected) {
+        document.getElementById('audio-err').textContent = 'Start Control first';
+        return;
+    }
     audioEnabled = !audioEnabled;
     await pushAudio();
 }
@@ -682,6 +1173,11 @@ function onSlider() {
     if (audioEnabled) pushAudio();
 }
 async function pushAudio() {
+    if (!controlConnected) {
+        audioEnabled = false;
+        document.getElementById('audio-err').textContent = 'Start Control first';
+        return;
+    }
     try {
         const res  = await fetch('/api/audio', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -705,19 +1201,25 @@ async function pushAudio() {
 }
 
 (async function pollLevel() {
+    if (!controlConnected) {
+        const vu = document.getElementById('vu-fill');
+        if (vu) vu.style.width = '0%';
+        setTimeout(pollLevel, 1000);
+        return;
+    }
     try {
         const res  = await fetch('/api/audio/level');
         const data = await res.json();
         document.getElementById('vu-fill').style.width = (data.level * 100).toFixed(1) + '%';
     } catch {}
-    setTimeout(pollLevel, 80);
+    setTimeout(pollLevel, audioEnabled ? 80 : 1000);
 })();
 
 (async function pollStatus() {
     try {
         const r = await fetch('/api/status');
         const d = await r.json();
-        document.getElementById('conn-dot').className = d.connected ? 'on' : 'off';
+        setControlState(d.connected, d.error, d.phase);
     } catch {}
     setTimeout(pollStatus, 3000);
 })();
@@ -726,7 +1228,20 @@ async function pushAudio() {
 </html>"""
 
 
+def shutdown_control():
+    global _shutdown_started
+    if _shutdown_started:
+        return
+    _shutdown_started = True
+    try:
+        stop_control()
+    except Exception as exc:
+        print(f"Failed to release BLE control cleanly: {exc}")
+
+
 if __name__ == "__main__":
-    get_controller()
     print("http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, threaded=True)
+    try:
+        app.run(host="127.0.0.1", port=5000, threaded=True)
+    finally:
+        shutdown_control()

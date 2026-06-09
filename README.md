@@ -134,14 +134,33 @@ python .\zengge_variant_sweep.py --response --notify-each --delay 0.8
 This connects once, then tries labelled command variants with distinct colours.
 If a fixture changes, stop the script and note the printed step.
 
-## Provision One Light
+## Restore Remote Control
 
 ```powershell
-python .\provision_one_light.py light-01
+python .\restore_default_mesh.py --aggressive-reset --attempts 5 --scan-timeout 12 --timeout 18
 ```
 
-This moves one selected light into a known local mesh and saves the old/new mesh
-details in `provisioned_mesh.json`.
+This restores the lamps to the default Zengge mesh credentials and then sends
+the mesh reset opcode. That reset step is required for the physical remote to
+work again; credential restore alone is not enough. By default the reset is sent
+as a single broadcast command after all lamps verify on the default mesh, which
+is much faster than opening one BLE connection per lamp.
+
+The UI's Start Control path is optimized for the normal post-remote state: it
+does one BLE scan, provisions lamps into the Hao Deng app mesh with a small
+parallel worker pool, restores mesh addresses from `hao_deng_mesh.json`, and
+falls back to a slower mixed-state retry if a previous run was interrupted.
+
+Useful recovery options:
+
+```powershell
+python .\restore_default_mesh.py --lamp Lamp8 --attempts 5 --scan-timeout 12 --timeout 18
+python .\restore_default_mesh.py --aggressive-reset --per-lamp-reset --attempts 5 --scan-timeout 12 --timeout 18
+python .\restore_default_mesh.py --loop --aggressive-reset
+```
+
+Use `--lamp` for a flaky or out-of-range fixture. Use `--per-lamp-reset` only
+if the fast broadcast reset does not restore remote control.
 
 ## Physical Identification
 

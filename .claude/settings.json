@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(pip install flask)"
+      "PowerShell(pip install flask)",
+      "WebFetch(domain:support.roland.com)",
+      "WebSearch",
+      "PowerShell(Start-Process \"ms-windows-store://search/?query=MidiBerry\")",
+      "Skill(fewer-permission-prompts)",
+      "Skill(fewer-permission-prompts:*)",
+      "Bash(ls ~/.claude/projects/ 2>/dev/null | head -20)",
+      "Read(//c/Users/Steve/.claude/projects/**)",
+      "Bash(node -e ' *)",
+      "Bash(dotnet run *)",
+      "Bash(dotnet build *)",
+      "Bash(cat > *)",
+      "Bash(mkdir *)",
+      "PowerShell(Get-PnpDevice *)",
+      "PowerShell(Get-AppxPackage *)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Read(//c/Users/Steve/AppData/Local/Temp/td27bridge/**)"
+    ],
+    "additionalDirectories": [
+      "\\tmp\\blescanner",
+      "c:\\tmp\\blescanner"
     ]
   }
 }
